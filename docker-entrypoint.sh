@@ -1,133 +1,144 @@
-FROM debian:jessie
+#!/usr/bin/env bash
+set -e
 
-RUN set -ex; \
-	if ! command -v gpg > /dev/null; then \
-		apt-get update; \
-		apt-get install -y --no-install-recommends \
-			gnupg \
-			dirmngr \
-		; \
-		rm -rf /var/lib/apt/lists/*; \
+# usage: file_env VAR [DEFAULT]
+#    ie: file_env 'XYZ_DB_PASSWORD' 'example'
+# (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
+#  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
+file_env() {
+	local var="$1"
+	local fileVar="${var}_FILE"
+	local def="${2:-}"
+	if [ "${!var:-}" ] && [ "${!fileVar:-}" ]; then
+		echo >&2 "error: both $var and $fileVar are set (but are exclusive)"
+		exit 1
+	fi
+	local val="$def"
+	if [ "${!var:-}" ]; then
+		val="${!var}"
+	elif [ "${!fileVar:-}" ]; then
+		val="$(< "${!fileVar}")"
+	fi
+	export "$var"="$val"
+	unset "$fileVar"
+}
+
+if [ "${1:0:1}" = '-' ]; then
+	set -- postgres "$@"
+fi
+
+# allow the container to be started with `--user`
+if [ "$1" = 'postgres' ] && [ "$(id -u)" = '0' ]; then
+	mkdir -p "$PGDATA"
+	chown -R postgres "$PGDATA"
+	chmod 700 "$PGDATA"
+
+	mkdir -p /var/run/postgresql
+	chown -R postgres /var/run/postgresql
+	chmod 775 /var/run/postgresql
+
+	# Create the transaction log directory before initdb is run (below) so the directory is owned by the correct user
+	if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
+		mkdir -p "$POSTGRES_INITDB_XLOGDIR"
+		chown -R postgres "$POSTGRES_INITDB_XLOGDIR"
+		chmod 700 "$POSTGRES_INITDB_XLOGDIR"
 	fi
 
-# explicitly set user/group IDs
-RUN groupadd -r postgres --gid=999 && useradd -r -g postgres --uid=999 postgres
+	exec gosu postgres "$BASH_SOURCE" "$@"
+fi
 
-# grab gosu for easy step-down from root
-ENV GOSU_VERSION 1.10
-RUN set -x \
-	&& apt-get update && apt-get install -y --no-install-recommends ca-certificates wget && rm -rf /var/lib/apt/lists/* \
-	&& wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$(dpkg --print-architecture)" \
-	&& wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$(dpkg --print-architecture).asc" \
-	&& export GNUPGHOME="$(mktemp -d)" \
-	&& gpg --keyserver ha.pool.sks-keyservers.net --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4 \
-	&& gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu \
-	&& rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc \
-	&& chmod +x /usr/local/bin/gosu \
-	&& gosu nobody true \
-	&& apt-get purge -y --auto-remove ca-certificates wget
+if [ "$1" = 'postgres' ]; then
+	mkdir -p "$PGDATA"
+	chown -R "$(id -u)" "$PGDATA" 2>/dev/null || :
+	chmod 700 "$PGDATA" 2>/dev/null || :
 
-# make the "en_US.UTF-8" locale so postgres will be utf-8 enabled by default
-RUN apt-get update && apt-get install -y locales && rm -rf /var/lib/apt/lists/* \
-	&& localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
-ENV LANG en_US.utf8
+	# look specifically for PG_VERSION, as it is expected in the DB dir
+	if [ ! -s "$PGDATA/PG_VERSION" ]; then
+		file_env 'POSTGRES_INITDB_ARGS'
+		if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
+			export POSTGRES_INITDB_ARGS="$POSTGRES_INITDB_ARGS --xlogdir $POSTGRES_INITDB_XLOGDIR"
+		fi
+		eval "initdb --username=postgres $POSTGRES_INITDB_ARGS"
 
-RUN mkdir /docker-entrypoint-initdb.d
+		# check password first so we can output the warning before postgres
+		# messes it up
+		file_env 'POSTGRES_PASSWORD'
+		if [ "$POSTGRES_PASSWORD" ]; then
+			pass="PASSWORD '$POSTGRES_PASSWORD'"
+			authMethod=md5
+		else
+			# The - option suppresses leading tabs but *not* spaces. :)
+			cat >&2 <<-'EOWARN'
+				****************************************************
+				WARNING: No password has been set for the database.
+				         This will allow anyone with access to the
+				         Postgres port to access your database. In
+				         Docker's default configuration, this is
+				         effectively any other container on the same
+				         system.
+				         Use "-e POSTGRES_PASSWORD=password" to set
+				         it in "docker run".
+				****************************************************
+			EOWARN
 
-RUN set -ex; \
-# pub   4096R/ACCC4CF8 2011-10-13 [expires: 2019-07-02]
-#       Key fingerprint = B97B 0AFC AA1A 47F0 44F2  44A0 7FCC 7D46 ACCC 4CF8
-# uid                  PostgreSQL Debian Repository
-	key='B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8'; \
-	export GNUPGHOME="$(mktemp -d)"; \
-	gpg --keyserver ha.pool.sks-keyservers.net --recv-keys "$key"; \
-	gpg --export "$key" > /etc/apt/trusted.gpg.d/postgres.gpg; \
-	rm -rf "$GNUPGHOME"; \
-	apt-key list
+			pass=
+			authMethod=trust
+		fi
 
-ENV PG_MAJOR 9.6
-ENV PG_VERSION 9.6.7-1.pgdg80+1
+		{
+			echo
+			echo "host all all all $authMethod"
+		} >> "$PGDATA/pg_hba.conf"
 
-RUN set -ex; \
-	\
-	dpkgArch="$(dpkg --print-architecture)"; \
-	case "$dpkgArch" in \
-		amd64|i386|ppc64el) \
-# arches officialy built by upstream
-			echo "deb http://apt.postgresql.org/pub/repos/apt/ jessie-pgdg main $PG_MAJOR" > /etc/apt/sources.list.d/pgdg.list; \
-			apt-get update; \
-			;; \
-		*) \
-# we're on an architecture upstream doesn't officially build for
-# let's build binaries from their published source packages
-			echo "deb-src http://apt.postgresql.org/pub/repos/apt/ jessie-pgdg main $PG_MAJOR" > /etc/apt/sources.list.d/pgdg.list; \
-			\
-			tempDir="$(mktemp -d)"; \
-			cd "$tempDir"; \
-			\
-			savedAptMark="$(apt-mark showmanual)"; \
-			\
-# build .deb files from upstream's source packages (which are verified by apt-get)
-			apt-get update; \
-			apt-get build-dep -y \
-				postgresql-common pgdg-keyring \
-				"postgresql-$PG_MAJOR=$PG_VERSION" \
-			; \
-			DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" \
-				apt-get source --compile \
-					postgresql-common pgdg-keyring \
-					"postgresql-$PG_MAJOR=$PG_VERSION" \
-			; \
-# we don't remove APT lists here because they get re-downloaded and removed later
-			\
-# reset apt-mark's "manual" list so that "purge --auto-remove" will remove all build dependencies
-# (which is done after we install the built packages so we don't have to redownload any overlapping dependencies)
-			apt-mark showmanual | xargs apt-mark auto > /dev/null; \
-			apt-mark manual $savedAptMark; \
-			\
-# create a temporary local APT repo to install from (so that dependency resolution can be handled by APT, as it should be)
-			ls -lAFh; \
-			dpkg-scanpackages . > Packages; \
-			grep '^Package: ' Packages; \
-			echo "deb [ trusted=yes ] file://$tempDir ./" > /etc/apt/sources.list.d/temp.list; \
-# work around the following APT issue by using "Acquire::GzipIndexes=false" (overriding "/etc/apt/apt.conf.d/docker-gzip-indexes")
-#   Could not open file /var/lib/apt/lists/partial/_tmp_tmp.ODWljpQfkE_._Packages - open (13: Permission denied)
-#   ...
-#   E: Failed to fetch store:/var/lib/apt/lists/partial/_tmp_tmp.ODWljpQfkE_._Packages  Could not open file /var/lib/apt/lists/partial/_tmp_tmp.ODWljpQfkE_._Packages - open (13: Permission denied)
-			apt-get -o Acquire::GzipIndexes=false update; \
-			;; \
-	esac; \
-	\
-	apt-get install -y postgresql-common; \
-	sed -ri 's/#(create_main_cluster) .*$/\1 = false/' /etc/postgresql-common/createcluster.conf; \
-	apt-get install -y \
-		"postgresql-$PG_MAJOR=$PG_VERSION" \
-		"postgresql-contrib-$PG_MAJOR=$PG_VERSION" \
-	; \
-	\
-	rm -rf /var/lib/apt/lists/*; \
-	\
-	if [ -n "$tempDir" ]; then \
-# if we have leftovers from building, let's purge them (including extra, unnecessary build deps)
-		apt-get purge -y --auto-remove; \
-		rm -rf "$tempDir" /etc/apt/sources.list.d/temp.list; \
+		# internal start of server in order to allow set-up using psql-client
+		# does not listen on external TCP/IP and waits until start finishes
+		PGUSER="${PGUSER:-postgres}" \
+		pg_ctl -D "$PGDATA" \
+			-o "-c listen_addresses='localhost'" \
+			-w start
+
+		file_env 'POSTGRES_USER' 'postgres'
+		file_env 'POSTGRES_DB' "$POSTGRES_USER"
+
+		psql=( psql -v ON_ERROR_STOP=1 )
+
+		if [ "$POSTGRES_DB" != 'postgres' ]; then
+			"${psql[@]}" --username postgres <<-EOSQL
+				CREATE DATABASE "$POSTGRES_DB" ;
+			EOSQL
+			echo
+		fi
+
+		if [ "$POSTGRES_USER" = 'postgres' ]; then
+			op='ALTER'
+		else
+			op='CREATE'
+		fi
+		"${psql[@]}" --username postgres <<-EOSQL
+			$op USER "$POSTGRES_USER" WITH SUPERUSER $pass ;
+		EOSQL
+		echo
+
+		psql+=( --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" )
+
+		echo
+		for f in /docker-entrypoint-initdb.d/*; do
+			case "$f" in
+				*.sh)     echo "$0: running $f"; . "$f" ;;
+				*.sql)    echo "$0: running $f"; "${psql[@]}" -f "$f"; echo ;;
+				*.sql.gz) echo "$0: running $f"; gunzip -c "$f" | "${psql[@]}"; echo ;;
+				*)        echo "$0: ignoring $f" ;;
+			esac
+			echo
+		done
+
+		PGUSER="${PGUSER:-postgres}" \
+		pg_ctl -D "$PGDATA" -m fast -w stop
+
+		echo
+		echo 'PostgreSQL init process complete; ready for start up.'
+		echo
 	fi
+fi
 
-# make the sample config easier to munge (and "correct by default")
-RUN mv -v "/usr/share/postgresql/$PG_MAJOR/postgresql.conf.sample" /usr/share/postgresql/ \
-	&& ln -sv ../postgresql.conf.sample "/usr/share/postgresql/$PG_MAJOR/" \
-	&& sed -ri "s!^#?(listen_addresses)\s*=\s*\S+.*!\1 = '*'!" /usr/share/postgresql/postgresql.conf.sample
-
-RUN mkdir -p /var/run/postgresql && chown -R postgres:postgres /var/run/postgresql && chmod 2777 /var/run/postgresql
-
-ENV PATH $PATH:/usr/lib/postgresql/$PG_MAJOR/bin
-ENV PGDATA /var/lib/postgresql/data
-RUN mkdir -p "$PGDATA" && chown -R postgres:postgres "$PGDATA" && chmod 777 "$PGDATA" # this 777 will be replaced by 700 at runtime (allows semi-arbitrary "--user" values)
-VOLUME /var/lib/postgresql/data
-
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN ln -s usr/local/bin/docker-entrypoint.sh / # backwards compat
-ENTRYPOINT ["docker-entrypoint.sh"]
-
-EXPOSE 5432
-CMD ["postgres"]
+exec "$@"
